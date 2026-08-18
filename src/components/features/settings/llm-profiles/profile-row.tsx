@@ -6,6 +6,7 @@ import { I18nKey } from "#/i18n/declaration";
 import { EllipsisButton } from "#/components/features/conversation-panel/ellipsis-button";
 import { BrandBadge } from "#/components/shared/badge";
 import { cn } from "#/utils/utils";
+import { useFreeModels } from "#/hooks/query/use-free-models";
 import { formatModelNameForDisplay } from "#/utils/format-model-name";
 import {
   settingsListIconActionButtonClassName,
@@ -39,7 +40,8 @@ export function ProfileRow({
   const { t } = useTranslation("openhands");
   const [menuOpen, setMenuOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
-  const displayModel = formatModelNameForDisplay(profile.model);
+  const freeModels = useFreeModels();
+  const displayModel = formatModelNameForDisplay(profile.model, freeModels);
 
   return (
     <div

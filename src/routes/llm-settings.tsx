@@ -33,10 +33,8 @@ import {
   resolveLlmAuthType,
 } from "#/constants/llm-subscription";
 import { useOpenAISubscriptionModels } from "#/hooks/query/use-llm-subscription-models";
-import {
-  FREE_OPENHANDS_MODEL_NOTE,
-  isFreeOpenHandsModel,
-} from "#/utils/format-model-name";
+import { useDefaultModel, useFreeModels } from "#/hooks/query/use-free-models";
+import { isFreeOpenHandsModel } from "#/utils/format-model-name";
 
 const LLM_EXCLUDED_KEYS = new Set([
   "llm.model",
@@ -108,16 +106,21 @@ function OpenHandsApiKeyHelp({ testId }: OpenHandsApiKeyHelpProps) {
   );
 }
 
-function OpenHandsFreeModelsNote() {
+function OpenHandsFreeModelsNote({ note }: { note: string }) {
   return (
     <p
       data-testid="openhands-free-models-note"
       className="flex items-start gap-2 text-xs text-warning"
     >
       <Info className="mt-0.5 size-4 shrink-0 text-warning" aria-hidden />
-      <span>{FREE_OPENHANDS_MODEL_NOTE}</span>
+      <span>{note}</span>
     </p>
   );
+}
+
+function buildFreeModelsNote(freeModels: ReadonlySet<string>): string {
+  const ids = [...freeModels].join(", ");
+  return `Free OpenHands models: ${ids}. Other provider endpoints with similar model names may require separate billing.`;
 }
 
 export function LlmSettingsScreen({
@@ -176,10 +179,17 @@ export function LlmSettingsScreen({
     }
   }, [initialAuthType]);
 
-  const defaultModel = String(
-    (DEFAULT_SETTINGS.agent_settings?.llm as Record<string, unknown>)?.model ??
-      "",
-  );
+  const freeModels = useFreeModels();
+  const dbDefaultModel = useDefaultModel();
+
+  // Prefer the DB-driven default (cloud) and fall back to the bundled default
+  // when the backend exposes none (e.g. the local agent-server).
+  const defaultModel =
+    dbDefaultModel ??
+    String(
+      (DEFAULT_SETTINGS.agent_settings?.llm as Record<string, unknown>)
+        ?.model ?? "",
+    );
 
   const getInitialView = React.useCallback(
     (
@@ -406,8 +416,10 @@ export function LlmSettingsScreen({
 
                   {showOpenHandsApiKeyHelp ? (
                     <>
-                      {isFreeOpenHandsModel(modelValue) ? (
-                        <OpenHandsFreeModelsNote />
+                      {isFreeOpenHandsModel(modelValue, freeModels) ? (
+                        <OpenHandsFreeModelsNote
+                          note={buildFreeModelsNote(freeModels)}
+                        />
                       ) : null}
                       <OpenHandsApiKeyHelp testId="openhands-api-key-help-2" />
                     </>
@@ -441,6 +453,7 @@ export function LlmSettingsScreen({
     [
       defaultModel,
       embedded,
+      freeModels,
       isWaitingForSubscriptionModels,
       settings?.llm_api_key_set,
       subscriptionModels,
