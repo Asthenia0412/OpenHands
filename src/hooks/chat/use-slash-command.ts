@@ -1,14 +1,13 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { useConversationSkills } from "#/hooks/query/use-conversation-skills";
 import { SkillInfo } from "#/types/settings";
-import { Microagent } from "#/api/open-hands.types";
 import { BUILT_IN_COMMANDS, MODEL_COMMAND } from "#/utils/constants";
 import { useActiveBackend } from "#/contexts/active-backend-context";
 import { useLlmProfiles } from "#/hooks/query/use-llm-profiles";
 import { useFreeModels } from "#/hooks/query/use-free-models";
 import { formatModelNameForDisplay } from "#/utils/format-model-name";
 
-export type SlashCommandSkill = SkillInfo | Microagent;
+export type SlashCommandSkill = SkillInfo;
 
 export interface SlashCommandItem {
   skill: SlashCommandSkill;
@@ -90,6 +89,7 @@ export const useSlashCommand = (
         skill: {
           name: profile.name,
           type: "agentskills",
+          source: null,
           content: profile.model
             ? `Switch to ${formatModelNameForDisplay(profile.model, freeModels)}`
             : "Switch to this LLM profile",

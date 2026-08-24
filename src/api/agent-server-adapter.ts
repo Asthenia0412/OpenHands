@@ -22,8 +22,16 @@ import {
   PluginSpec,
   AppConversation,
   AppConversationPage,
+  RuntimeConversationStats,
   SandboxStatus,
 } from "./conversation-service/agent-server-conversation-service.types";
+import { combineUsageMetrics } from "#/utils/conversation-metrics";
+import {
+  buildSkillEnablementFilter,
+  findInvokedCatalogSkill,
+  toSkillEnablement,
+  type SkillEnablement,
+} from "#/utils/skill-enablement";
 import SettingsService from "./settings-service/settings-service.api";
 import { getStoredConversationMetadata } from "./conversation-metadata-store";
 import LLMSubscriptionService from "./llm-subscription-service";
@@ -63,6 +71,12 @@ export interface DirectConversationInfo {
       per_turn_token?: number;
     } | null;
   } | null;
+  /**
+   * Raw per-usage-id LLM stats from the agent-server. Search/list responses
+   * often carry real usage here even when `metrics` above comes back unset;
+   * {@link toAppConversation} combines this as a fallback in that case.
+   */
+  stats?: RuntimeConversationStats | null;
   agent?: {
     /**
      * Pydantic discriminator from the SDK union: ``"ACPAgent"`` for ACP CLI
@@ -375,7 +389,7 @@ export function toAppConversation(
               }
             : null,
         }
-      : null,
+      : combineUsageMetrics(info.stats),
     created_at: info.created_at,
     updated_at: info.updated_at,
     execution_status:
@@ -433,6 +447,8 @@ type ConversationSettingsPayload = SettingsRecord & {
 };
 
 export const ACP_SERVER_TAG_KEY = "acpserver";
+export const CLIENT_SOURCE_TAG_KEY = "clientsource";
+export const AGENT_CANVAS_SOURCE = "agentcanvas";
 
 export const AUTOMATION_TRIGGER_TAG_KEY = "automationtrigger";
 export const AUTOMATION_ID_TAG_KEY = "automationid";
@@ -456,6 +472,7 @@ export const AUTOMATION_TAG_KEYS: readonly string[] = [
  * rows. Each is either already surfaced by a first-class UI source or is
  * internal routing data:
  * - ``acpserver`` → ACP provider chip
+ * - ``clientsource`` → telemetry attribution
  * - ``title`` → conversation card heading
  * - git / repo / branch / workspace stamps → repo-branch metadata + directory
  *   footer / hovercard rows (``selected_repository``, ``selected_branch``,
@@ -466,6 +483,7 @@ export const AUTOMATION_TAG_KEYS: readonly string[] = [
  */
 export const RESERVED_CONVERSATION_TAG_KEYS: ReadonlySet<string> = new Set([
   ACP_SERVER_TAG_KEY,
+  CLIENT_SOURCE_TAG_KEY,
   AUTOMATION_ID_TAG_KEY,
   AUTOMATION_RUN_ID_TAG_KEY,
   "title",
@@ -737,7 +755,8 @@ function buildBundledSkills(): BundledSkill[] {
 function buildAgentContext(
   agentSettings: SettingsRecord,
   runtimeServicesInfo?: RuntimeServicesInfo | null,
-  disabledSkills: string[] = [],
+  enablement: SkillEnablement = {},
+  invokedCatalogSkill?: string,
 ): SettingsRecord {
   const runtimeServicesSuffix =
     buildRuntimeServicesSystemSuffix(runtimeServicesInfo);
@@ -748,11 +767,25 @@ function buildAgentContext(
   const existingSkills = Array.isArray(existingContext.skills)
     ? (existingContext.skills as SettingsRecord[])
     : [];
+  const disabledSkills = enablement.disabledSkills ?? [];
   const disabledSkillNames = new Set(disabledSkills);
-  const mergedSkills = [...existingSkills, ...buildBundledSkills()].filter(
-    (skill) =>
-      typeof skill.name !== "string" || !disabledSkillNames.has(skill.name),
-  );
+  const isSkillEnabled = buildSkillEnablementFilter(enablement);
+
+  // The bundled catalog is allow-listed, not deny-listed: it is a build-time
+  // snapshot of ~60 skills, so a deny-list puts every future addition into
+  // every system prompt (OpenHands#16302). Skills the agent context already
+  // carries are user-authored and stay opt-out. A skill the opening message
+  // invokes by name overrides both, for this conversation only.
+  const mergedSkills = [
+    ...existingSkills.filter(
+      (skill) =>
+        typeof skill.name !== "string" || !disabledSkillNames.has(skill.name),
+    ),
+    ...buildBundledSkills().filter(
+      (skill) =>
+        skill.name === invokedCatalogSkill || isSkillEnabled(skill.name),
+    ),
+  ];
 
   return {
     ...existingContext,
@@ -769,6 +802,11 @@ function buildAgentContext(
     load_public_skills: false,
     load_user_skills: true,
     load_project_skills: true,
+    // The backend also auto-loads user/project skills; the deny-list must
+    // travel with the context so those skills are excluded from the system
+    // prompt too. The allow-list has no counterpart to send: the backend
+    // loads no catalog skills of its own (`load_public_skills` is false).
+    disabled_skills: disabledSkills,
     ...(runtimeServicesSuffix
       ? { system_message_suffix: runtimeServicesSuffix }
       : {}),
@@ -805,6 +843,7 @@ function resolveAcpCommand(agentSettings: SettingsRecord): unknown {
 function buildConfiguredAcpAgentSettings(
   settings: Settings,
   runtimeServicesInfo?: RuntimeServicesInfo | null,
+  query?: string,
 ): AgentSettingsPayload {
   const agentSettings = toRecord(settings.agent_settings);
   const payload: AgentSettingsPayload = {
@@ -812,7 +851,8 @@ function buildConfiguredAcpAgentSettings(
     agent_context: buildAgentContext(
       agentSettings,
       runtimeServicesInfo,
-      settings.disabled_skills,
+      toSkillEnablement(settings),
+      findInvokedCatalogSkill(query),
     ),
   };
 
@@ -871,6 +911,7 @@ function buildConfiguredAcpAgentSettings(
 function buildConfiguredOpenHandsAgentSettings(
   settings: Settings,
   runtimeServicesInfo?: RuntimeServicesInfo | null,
+  query?: string,
 ): AgentSettingsPayload {
   const agentSettings = toRecord(settings.agent_settings);
   const llm = toRecord(agentSettings.llm);
@@ -928,7 +969,8 @@ function buildConfiguredOpenHandsAgentSettings(
     agent_context: buildAgentContext(
       agentSettings,
       runtimeServicesInfo,
-      settings.disabled_skills,
+      toSkillEnablement(settings),
+      findInvokedCatalogSkill(query),
     ),
     tools: getAgentTools(agentSettings),
   };
@@ -937,10 +979,15 @@ function buildConfiguredOpenHandsAgentSettings(
 function buildConfiguredAgentSettings(
   settings: Settings,
   runtimeServicesInfo?: RuntimeServicesInfo | null,
+  query?: string,
 ): AgentSettingsPayload {
   return isAcpAgent(settings)
-    ? buildConfiguredAcpAgentSettings(settings, runtimeServicesInfo)
-    : buildConfiguredOpenHandsAgentSettings(settings, runtimeServicesInfo);
+    ? buildConfiguredAcpAgentSettings(settings, runtimeServicesInfo, query)
+    : buildConfiguredOpenHandsAgentSettings(
+        settings,
+        runtimeServicesInfo,
+        query,
+      );
 }
 
 function buildConfiguredConversationSettings(options: {
@@ -1051,6 +1098,7 @@ export function buildStartConversationRequest(
   const agentSettings = buildConfiguredAgentSettings(
     sourceAgentSettings,
     options.runtimeServicesInfo,
+    options.query,
   );
   const acpServerTag = acpMode
     ? getAcpServerTag(sourceAgentSettings)
@@ -1119,10 +1167,17 @@ export function buildStartConversationRequest(
     worktree: options.worktree ?? true,
   };
 
+  // Stamp the client source tag so the agent-server can attribute the
+  // conversation to Canvas in telemetry (conversation_source = "canvas").
   // A profile launch resolves the ACP server server-side, so don't stamp the
   // tag from current settings (it may not match the launched profile).
   if (!options.agentProfileId && acpServerTag) {
-    payload.tags = { [ACP_SERVER_TAG_KEY]: acpServerTag };
+    payload.tags = {
+      [ACP_SERVER_TAG_KEY]: acpServerTag,
+      [CLIENT_SOURCE_TAG_KEY]: AGENT_CANVAS_SOURCE,
+    };
+  } else {
+    payload.tags = { [CLIENT_SOURCE_TAG_KEY]: AGENT_CANVAS_SOURCE };
   }
 
   // ``secrets_encrypted`` makes the agent-server decrypt request secrets at
